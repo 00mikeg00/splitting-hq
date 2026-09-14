@@ -561,6 +561,7 @@ function beatLetter(i){
 
 /* ---------------- persistence (Google Sheet via Apps Script) ---------------- */
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwYQkvdhqiYF9EzXWVhYS8QKAlMDOpbCUENmojQdeOyz29voMtMDPDrBhNX3gcCPw_m/exec';
+const API_TOKEN = 'OEAKbJauC6ckBQEfTPt13Ae4EsWBSYxv'; // must exactly match SHARED_SECRET in the Apps Script
 
 function apiToState(api){
   const st = emptyState();
@@ -607,8 +608,12 @@ function apiToState(api){
 
 async function load(){
   try{
-    const res = await fetch(APPS_SCRIPT_URL, { method: 'GET' });
+    const url = APPS_SCRIPT_URL + '?token=' + encodeURIComponent(API_TOKEN);
+    const res = await fetch(url, { method: 'GET' });
     const api = await res.json();
+    if(api && api.ok === false){
+      throw new Error(api.error || 'unauthorized');
+    }
     if(api && (api.episodes || api.characters || api.tags)){
       state = apiToState(api);
       if(!api.episodes || api.episodes.length === 0){
@@ -637,7 +642,7 @@ async function pushFullState(){
   const res = await fetch(APPS_SCRIPT_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ type: 'full', data: state })
+    body: JSON.stringify({ type: 'full', token: API_TOKEN, data: state })
   });
   const result = await res.json();
   if(!result.ok) throw new Error(result.error || 'save failed');
