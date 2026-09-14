@@ -457,7 +457,6 @@ const LANES = [
 ];
 const SEASONS = 3;
 const EPISODES_PER_SEASON = 8;
-const STORAGE_KEY = 'splitting-hq:main';
 const DEFAULT_TAGS = [
   { id: 't1', name: 'Original Timeline', color: '#3f7d3f' },
   { id: 't2', name: 'Investigative Timeline', color: '#7ec4e0' },
@@ -560,38 +559,88 @@ function beatLetter(i){
   return s;
 }
 
-/* ---------------- persistence ---------------- */
+/* ---------------- persistence (Google Sheet via Apps Script) ---------------- */
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwYQkvdhqiYF9EzXWVhYS8QKAlMDOpbCUENmojQdeOyz29voMtMDPDrBhNX3gcCPw_m/exec';
+
+function apiToState(api){
+  const st = emptyState();
+  st.title = (api.meta && api.meta.title) || 'Splitting';
+  st.characters = (api.characters || []).map(c => ({ id: c.id, name: c.name || '' }));
+  st.tags = (api.tags || []).length
+    ? api.tags.map(t => ({ id: t.id, name: t.name || '', color: t.color || '#b5482f' }))
+    : DEFAULT_TAGS.map(t => ({...t}));
+
+  const byKey = {};
+  (api.episodes || []).forEach(ep => { byKey[ep.season + ':' + ep.episode] = ep; });
+
+  st.episodes = st.episodes.map(placeholder => {
+    const found = byKey[placeholder.season + ':' + placeholder.episode];
+    if(!found) return placeholder;
+    const lanes = emptyLanes();
+    if(found.lanes){
+      LANES.forEach(l => {
+        if(Array.isArray(found.lanes[l.id])){
+          lanes[l.id] = found.lanes[l.id].map(c => ({
+            id: c.id, title: c.title || '', body: c.body || '',
+            tagId: c.tagId || null,
+            characterIds: Array.isArray(c.characterIds) ? c.characterIds : [],
+            pages: typeof c.pages === 'number' ? c.pages : 0,
+            beats: Array.isArray(c.beats) ? c.beats : []
+          }));
+        }
+      });
+    }
+    return {
+      id: found.id || placeholder.id,
+      season: found.season, episode: found.episode,
+      title: found.title || '',
+      premise: found.premise || '',
+      treatment: found.treatment || '',
+      scriptPath: found.scriptPath || '',
+      stageStatus: found.stageStatus || emptyStageStatus(),
+      lanes
+    };
+  });
+
+  return st;
+}
+
 async function load(){
   try{
-    const res = await window.storage.get(STORAGE_KEY);
-    if(res && res.value){
-      state = JSON.parse(res.value);
-      if(!state.title) state.title = 'Splitting';
-      if(!Array.isArray(state.tags)) state.tags = DEFAULT_TAGS.map(t => ({...t}));
-      if(!Array.isArray(state.characters)) state.characters = [];
-      if(!Array.isArray(state.episodes) || state.episodes.length === 0) state.episodes = emptyState().episodes;
-      state.episodes.forEach(ep => {
-        if(!ep.lanes) ep.lanes = emptyLanes();
-        LANES.forEach(l => { if(!ep.lanes[l.id]) ep.lanes[l.id] = []; });
-        if(typeof ep.premise !== 'string') ep.premise = '';
-        if(typeof ep.treatment !== 'string') ep.treatment = '';
-        if(typeof ep.scriptPath !== 'string') ep.scriptPath = '';
-        if(!ep.stageStatus || typeof ep.stageStatus !== 'object') ep.stageStatus = emptyStageStatus();
-        STAGES.forEach(s => { if(!ep.stageStatus[s]) ep.stageStatus[s] = 'none'; });
-        LANES.forEach(l => {
-          ep.lanes[l.id].forEach(c => {
-            if(!Array.isArray(c.characterIds)) c.characterIds = [];
-            if(typeof c.pages !== 'number') c.pages = 0;
-            if(!Array.isArray(c.beats)) c.beats = [];
-          });
-        });
-      });
+    const res = await fetch(APPS_SCRIPT_URL, { method: 'GET' });
+    const api = await res.json();
+    if(api && (api.episodes || api.characters || api.tags)){
+      state = apiToState(api);
+      if(!api.episodes || api.episodes.length === 0){
+        // Empty sheet — seed it with the blank 24-episode structure.
+        await pushFullState();
+      }
     } else {
       state = emptyState();
     }
+    setSyncStatus('Synced', false);
   } catch(e){
+    console.error('load failed', e);
     state = emptyState();
+    setSyncStatus('Couldn\u2019t reach the sheet \u2014 working offline', true);
   }
+}
+
+function setSyncStatus(text, isError){
+  const el = document.getElementById('footerHint');
+  if(!el) return;
+  el.textContent = text;
+  el.style.color = isError ? 'var(--accent)' : '';
+}
+
+async function pushFullState(){
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ type: 'full', data: state })
+  });
+  const result = await res.json();
+  if(!result.ok) throw new Error(result.error || 'save failed');
 }
 
 let saveTimer = null;
@@ -601,6 +650,7 @@ let lastSnapshot = null;
 
 function save(){
   clearTimeout(saveTimer);
+  setSyncStatus('Saving\u2026', false);
   saveTimer = setTimeout(async () => {
     try{
       const json = JSON.stringify(state);
@@ -609,10 +659,14 @@ function save(){
         if(undoStack.length > UNDO_LIMIT) undoStack.shift();
       }
       lastSnapshot = json;
-      await window.storage.set(STORAGE_KEY, json);
+      await pushFullState();
+      setSyncStatus('Splitting HQ \u00b7 synced to Google Sheet', false);
       updateUndoBtn();
-    } catch(e){ console.error('save failed', e); }
-  }, 250);
+    } catch(e){
+      console.error('save failed', e);
+      setSyncStatus('Sync failed \u2014 will retry on next change', true);
+    }
+  }, 600);
 }
 
 async function undo(){
@@ -621,7 +675,8 @@ async function undo(){
   const prev = undoStack.pop();
   state = JSON.parse(prev);
   lastSnapshot = prev;
-  try{ await window.storage.set(STORAGE_KEY, prev); } catch(e){ console.error('undo save failed', e); }
+  try{ await pushFullState(); setSyncStatus('Splitting HQ \u00b7 synced to Google Sheet', false); }
+  catch(e){ console.error('undo save failed', e); setSyncStatus('Sync failed \u2014 will retry on next change', true); }
   renderAll();
   updateUndoBtn();
 }
@@ -1476,6 +1531,7 @@ document.addEventListener('keydown', e => {
 });
 
 (async function init(){
+  setSyncStatus('Loading from Google Sheet\u2026', false);
   await load();
   lastSnapshot = JSON.stringify(state);
   renderLegendDots();
